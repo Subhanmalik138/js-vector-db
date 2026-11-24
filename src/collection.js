@@ -7,9 +7,14 @@
 
 import { normalize, similarity, validateVector, METRICS } from './distance.js';
 import { matchFilter } from './filters.js';
+import { HnswIndex } from './hnsw.js';
 import { ValidationError } from './errors.js';
 
 const HNSW_MIN_SIZE = 64;
+// Rebuild the graph once tombstones pass 25% of the live set (min 16):
+// lazy deletes are cheap, but a graph full of dead nodes wastes every walk.
+const REBUILD_TOMBSTONE_FRACTION = 0.25;
+const REBUILD_TOMBSTONE_MIN = 16;
 
 export class Collection {
   constructor({ name, dimension, metric = 'cosine', seed = 42 }) {
@@ -27,7 +32,10 @@ export class Collection {
     this.metric = metric;
     this.seed = seed;
     this.vectors = new Map(); // id -> { vector: Float32Array, metadata }
-    this.index = null; // HNSW index, attached by src/hnsw.js
+    // The graph is maintained on every insert from the start, but search
+    // only trusts it once the collection is big enough for the walk to
+    // beat a linear scan.
+    this.index = new HnswIndex({ dimension, metric, seed });
   }
 
   #prepare(vector) {
@@ -56,7 +64,17 @@ export class Collection {
 
   delete(id) {
     const existed = this.vectors.delete(id);
-    if (existed && this.index) this.index.delete(id);
+    if (existed && this.index) {
+      this.index.delete(id);
+      if (
+        this.index.deletedCount >=
+        Math.max(REBUILD_TOMBSTONE_MIN, this.size * REBUILD_TOMBSTONE_FRACTION)
+      ) {
+        this.index.rebuild(
+          [...this.vectors.entries()].map(([vid, entry]) => ({ id: vid, vector: entry.vector })),
+        );
+      }
+    }
     return existed;
   }
 
@@ -76,7 +94,11 @@ export class Collection {
       throw new ValidationError('k must be a positive integer');
     }
     if (!filter && this.index && this.size >= HNSW_MIN_SIZE) {
-      return this.index.search(q, k);
+      // The index returns ids + scores; metadata lives in the collection.
+      return this.index.search(q, k).map((r) => ({
+        ...r,
+        metadata: { ...this.vectors.get(r.id).metadata },
+      }));
     }
     return this.#bruteForce(q, k, filter);
   }
@@ -122,6 +144,9 @@ export class Collection {
         metadata: item.metadata ?? {},
       });
     }
+    collection.index.rebuild(
+      [...collection.vectors.entries()].map(([id, entry]) => ({ id, vector: entry.vector })),
+    );
     return collection;
   }
 }
